@@ -1,4 +1,5 @@
 import os
+import re
 import threading
 import requests
 import discord
@@ -109,10 +110,38 @@ class VerifyView(discord.ui.View):
 ALLOWED_YOUTUBE_CHANNEL = "youtube-upload"
 YOUTUBE_PATTERNS = ["youtube.com", "youtu.be"]
 
+DISCORD_INVITE_PATTERN = re.compile(
+    r"(discord\.gg/|discord(?:app)?\.com/invite/)\S+",
+    re.IGNORECASE
+)
+
+def has_invite_permission(member: discord.Member) -> bool:
+    """Mods, admins, and the Dev are allowed to post invite links."""
+    if member.id == DEV_USER_ID:
+        return True
+    if member.guild_permissions.administrator or member.guild_permissions.manage_guild:
+        return True
+    if any(r.name in PROTECTED_ROLES for r in member.roles):
+        return True
+    return False
+
+
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
+        return
+
+    if DISCORD_INVITE_PATTERN.search(message.content) and not has_invite_permission(message.author):
+        try:
+            await message.delete()
+            warning = await message.channel.send(
+                f"{message.author.mention} \u26a0 Sharing Discord invite links requires permission "
+                f"from a Moderator or the Dev."
+            )
+            await warning.delete(delay=8)
+        except discord.Forbidden:
+            pass
         return
 
     if message.channel.name != ALLOWED_YOUTUBE_CHANNEL:
@@ -120,8 +149,10 @@ async def on_message(message):
         if any(pattern in content_lower for pattern in YOUTUBE_PATTERNS):
             try:
                 await message.delete()
+                target_channel = discord.utils.get(message.guild.text_channels, name=ALLOWED_YOUTUBE_CHANNEL)
                 warning = await message.channel.send(
-                    f"{message.author.mention} ⚠ YouTube links are only allowed in <#{discord.utils.get(message.guild.text_channels, name=ALLOWED_YOUTUBE_CHANNEL).id if discord.utils.get(message.guild.text_channels, name=ALLOWED_YOUTUBE_CHANNEL) else ALLOWED_YOUTUBE_CHANNEL}>."
+                    f"{message.author.mention} \u26a0 YouTube links are only allowed in "
+                    f"{f'<#{target_channel.id}>' if target_channel else ALLOWED_YOUTUBE_CHANNEL}."
                 )
                 await warning.delete(delay=8)
             except discord.Forbidden:
@@ -129,9 +160,6 @@ async def on_message(message):
             return
 
     await bot.process_commands(message)
-
-
-WELCOME_CHANNEL_NAME = "welcome"
 
 
 @bot.event
@@ -165,7 +193,8 @@ async def on_member_join(member):
 async def on_ready():
     print(f"✓ Bot login sebagai {bot.user}")
     bot.add_view(VerifyView())  # Register persistent view supaya tombol tetap jalan setelah restart
-    bot.add_view(RoleSelectView())  # Register persistent view untuk role select menu
+    bot.add_view(RoleSelectView())
+    bot.add_view(PartnershipRequestView())  # Register persistent view untuk role select menu
     try:
         synced = await bot.tree.sync()
         print(f"✓ {len(synced)} slash command(s) synced")
@@ -409,6 +438,135 @@ async def statusweb(interaction: discord.Interaction):
     embed.set_footer(text="getrbx3d.qzz.io")
 
     await interaction.response.send_message(embed=embed, view=StatusToggleView())
+
+
+import uuid
+
+class PartnershipModal(discord.ui.Modal, title="Partnership Request"):
+    owner = discord.ui.TextInput(
+        label="Community Owner (name/@mention)",
+        placeholder="e.g. @JohnDoe or JohnDoe#1234",
+        required=True,
+        max_length=100
+    )
+    invite_link = discord.ui.TextInput(
+        label="Discord Invite Link",
+        placeholder="https://discord.gg/xxxxxxx",
+        required=True,
+        max_length=200
+    )
+    details = discord.ui.TextInput(
+        label="About the community (optional)",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=500
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        submission_id = str(uuid.uuid4())[:8]
+        partnership_submissions[submission_id] = {
+            "requester_id": interaction.user.id,
+            "channel_id": interaction.channel.id,
+            "owner": str(self.owner),
+            "link": str(self.invite_link),
+            "details": str(self.details) if self.details.value else "None provided",
+        }
+
+        dev = interaction.client.get_user(DEV_USER_ID) or await interaction.client.fetch_user(DEV_USER_ID)
+
+        embed = discord.Embed(title="\U0001f91d New Partnership Request", color=0x00D4FF)
+        embed.add_field(name="Requested by", value=f"{interaction.user.mention} ({interaction.user})", inline=False)
+        embed.add_field(name="Community Owner", value=partnership_submissions[submission_id]["owner"], inline=False)
+        embed.add_field(name="Invite Link", value=partnership_submissions[submission_id]["link"], inline=False)
+        embed.add_field(name="Details", value=partnership_submissions[submission_id]["details"], inline=False)
+        embed.set_footer(text=f"Submission ID: {submission_id}")
+
+        try:
+            await dev.send(embed=embed, view=PartnershipDecisionView(submission_id))
+            await interaction.response.send_message(
+                "\u2705 Your partnership request has been sent to the Dev for review!",
+                ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "\u26a0 Couldn't reach the Dev's DMs. Please contact them directly.",
+                ephemeral=True
+            )
+
+
+class PartnershipRequestView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="\U0001f91d Partnership", style=discord.ButtonStyle.primary, custom_id="partnership_request_button")
+    async def request_partnership(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PartnershipModal())
+
+
+class PartnershipDecisionView(discord.ui.View):
+    def __init__(self, submission_id: str):
+        super().__init__(timeout=None)
+        self.submission_id = submission_id
+        self.children[0].custom_id = f"partner_accept_{submission_id}"
+        self.children[1].custom_id = f"partner_deny_{submission_id}"
+
+    @discord.ui.button(label="ACCEPT", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve(interaction, approved=True)
+
+    @discord.ui.button(label="DENIED", style=discord.ButtonStyle.danger)
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve(interaction, approved=False)
+
+    async def _resolve(self, interaction: discord.Interaction, approved: bool):
+        data = partnership_submissions.get(self.submission_id)
+        if not data:
+            await interaction.response.edit_message(content="\u26a0 This request was already handled or expired.", embed=None, view=None)
+            return
+
+        result_text = "\u2705 **ACCEPTED**" if approved else "\u274c **DENIED**"
+        await interaction.response.edit_message(content=f"{result_text} by Dev.", embed=interaction.message.embeds[0], view=None)
+
+        channel = interaction.client.get_channel(data["channel_id"])
+        requester_mention = f"<@{data['requester_id']}>"
+
+        if channel:
+            try:
+                if approved:
+                    await channel.send(
+                        f"{requester_mention} \U0001f389 Your partnership request has been **ACCEPTED** by the Dev! "
+                        f"We'll be in touch about next steps."
+                    )
+                else:
+                    await channel.send(
+                        f"{requester_mention} Your partnership request has been **DENIED** by the Dev."
+                    )
+            except discord.Forbidden:
+                pass
+
+        del partnership_submissions[self.submission_id]
+
+
+@bot.tree.command(name="setup_partnership", description="Send the partnership request message (admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_partnership(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="\U0001f91d Community Partnership",
+        description=(
+            "Want to partner your community with **3DRBXMT**?\n\n"
+            "Click the button below and fill in the form with your community owner's "
+            "name and invite link. The Dev will review it and you'll get a result here."
+        ),
+        color=0x00D4FF
+    )
+    embed.set_footer(text="3DRBXMT \u00b7 Partnerships")
+    await interaction.channel.send(embed=embed, view=PartnershipRequestView())
+    await interaction.response.send_message("\u2713 Partnership message sent!", ephemeral=True)
+
+@setup_partnership.error
+async def setup_partnership_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("\u26a0 You don't have permission to run this command.", ephemeral=True)
 
 
 # ── MODERATION COMMANDS ───────────────────────────────────
