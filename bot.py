@@ -138,7 +138,9 @@ class VerifyView(discord.ui.View):
                 ephemeral=True
             )
 
-
+WELCOME_CHANNEL_NAME = "welcome"
+PARTNERSHIP_CHANNEL_NAME = "partnership"
+partnership_submissions = {}
 ALLOWED_YOUTUBE_CHANNEL = "youtube-upload"
 YOUTUBE_PATTERNS = ["youtube.com", "youtu.be"]
 
