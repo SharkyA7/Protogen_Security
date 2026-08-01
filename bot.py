@@ -1,17 +1,40 @@
 import os
 import re
+import time
+import asyncio
+import logging
 import threading
 import requests
 import discord
 from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
-from flask import Flask
+from flask import Flask, jsonify
 
 load_dotenv()
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
+# ── LOGGING ───────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("bot.log", encoding="utf-8")
+    ]
+)
+logger = logging.getLogger("3drbxmt-bot")
+
+# Tracks connection state for the /health endpoint
+bot_status = {
+    "ready": False,
+    "last_ready_at": None,
+    "last_disconnect_at": None,
+    "reconnect_count": 0,
+    "latency_ms": None,
+}
 
 
 def get_web_maintenance_state():
@@ -57,8 +80,17 @@ app = Flask(__name__)
 def home():
     return "Bot is alive!"
 
+@app.route("/health")
+def health():
+    """Real connection status, for uptime pingers to check instead of just '/'."""
+    status_code = 200 if bot_status["ready"] else 503
+    return jsonify(bot_status), status_code
+
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
+    # Disable Flask's default request logging spam in the console
+    log = logging.getLogger("werkzeug")
+    log.setLevel(logging.WARNING)
     app.run(host="0.0.0.0", port=port)
 
 intents = discord.Intents.default()
@@ -191,15 +223,32 @@ async def on_member_join(member):
 
 @bot.event
 async def on_ready():
-    print(f"✓ Bot login sebagai {bot.user}")
+    bot_status["ready"] = True
+    bot_status["last_ready_at"] = time.time()
+    bot_status["latency_ms"] = round(bot.latency * 1000, 1)
+    logger.info(f"Bot login sebagai {bot.user} (latency: {bot_status['latency_ms']}ms)")
     bot.add_view(VerifyView())  # Register persistent view supaya tombol tetap jalan setelah restart
     bot.add_view(RoleSelectView())
     bot.add_view(PartnershipRequestView())  # Register persistent view untuk role select menu
     try:
         synced = await bot.tree.sync()
-        print(f"✓ {len(synced)} slash command(s) synced")
+        logger.info(f"{len(synced)} slash command(s) synced")
     except Exception as e:
-        print(f"✗ Gagal sync commands: {e}")
+        logger.error(f"Gagal sync commands: {e}")
+
+
+@bot.event
+async def on_disconnect():
+    bot_status["ready"] = False
+    bot_status["last_disconnect_at"] = time.time()
+    logger.warning("Bot disconnected from Discord gateway")
+
+
+@bot.event
+async def on_resumed():
+    bot_status["ready"] = True
+    bot_status["reconnect_count"] += 1
+    logger.info(f"Session resumed (reconnect #{bot_status['reconnect_count']})")
 
 
 @bot.tree.command(name="setup_verify", description="Send a verification message with a button (admin only)")
@@ -1047,6 +1096,9 @@ async def dm(interaction: discord.Interaction, user: discord.User, message: str)
         await interaction.response.send_message("⚠ Couldn't DM this user (they may have DMs disabled).", ephemeral=True)
 
 
+_last_broadcast_at = {"time": 0}
+BROADCAST_COOLDOWN_SECONDS = 30
+
 @bot.tree.command(name="broadcast", description="Send a message to one or all text channels (Dev only)")
 @app_commands.describe(
     message="Message to broadcast",
@@ -1057,6 +1109,17 @@ async def broadcast(interaction: discord.Interaction, message: str, target: disc
     if not is_dev(interaction):
         await interaction.response.send_message("⛔ This command is restricted to the Dev only.", ephemeral=True)
         return
+
+    now = time.time()
+    elapsed = now - _last_broadcast_at["time"]
+    if elapsed < BROADCAST_COOLDOWN_SECONDS:
+        wait = round(BROADCAST_COOLDOWN_SECONDS - elapsed, 1)
+        await interaction.response.send_message(
+            f"⏳ Broadcast is on cooldown, try again in {wait}s (prevents Discord rate limiting).",
+            ephemeral=True
+        )
+        return
+    _last_broadcast_at["time"] = now
 
     await interaction.response.defer(ephemeral=True)
 
@@ -1069,7 +1132,12 @@ async def broadcast(interaction: discord.Interaction, message: str, target: disc
             sent_count += 1
             if minutes_before_delete > 0:
                 await sent_msg.delete(delay=minutes_before_delete * 60)
+            if not target:
+                await asyncio.sleep(1)  # small delay between channels to avoid hammering the API
         except discord.Forbidden:
+            continue
+        except discord.HTTPException as e:
+            logger.warning(f"Broadcast failed in #{channel.name}: {e}")
             continue
 
     scope_text = f"#{target.name}" if target else f"{sent_count} channel(s)"
@@ -1174,9 +1242,47 @@ async def deletedpythonfileproto_error(interaction: discord.Interaction, error):
         await interaction.response.send_message("⚠ You don't have permission to run this command.", ephemeral=True)
 
 
+def run_bot_forever():
+    """
+    Runs the bot with crash handling + exponential backoff.
+    This keeps ONE process alive across transient errors instead of relying
+    on the host to restart the whole process (which triggers a fresh
+    IDENTIFY to Discord's gateway and can contribute to rate limiting).
+    """
+    backoff = 5  # seconds
+    max_backoff = 300  # 5 minutes
+
+    while True:
+        try:
+            if not TOKEN:
+                logger.critical("DISCORD_BOT_TOKEN is not set. Exiting.")
+                return
+            bot_status["ready"] = False
+            bot.run(TOKEN, log_handler=None)
+            # bot.run() only returns after a clean shutdown (e.g. /shutdown command)
+            logger.info("Bot shut down cleanly. Not restarting.")
+            return
+        except discord.LoginFailure:
+            logger.critical("Invalid Discord token. Check DISCORD_BOT_TOKEN. Exiting.")
+            return
+        except discord.HTTPException as e:
+            if e.status == 429:
+                logger.error(f"Rate limited by Discord (429). Backing off for {backoff}s.")
+            else:
+                logger.error(f"Discord HTTP error: {e}. Retrying in {backoff}s.")
+        except Exception as e:
+            logger.error(f"Unhandled exception in bot.run(): {e}", exc_info=True)
+
+        bot_status["ready"] = False
+        bot_status["last_disconnect_at"] = time.time()
+        logger.info(f"Reconnecting in {backoff}s...")
+        time.sleep(backoff)
+        backoff = min(backoff * 2, max_backoff)  # exponential backoff, capped at 5 min
+
+
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
 
-    bot.run(TOKEN)
+    run_bot_forever()
