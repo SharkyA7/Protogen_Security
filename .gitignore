@@ -2,3 +2,5 @@
 patch_bot.py
 .env
 patch_bot.py
+patch_*.py
+bot.log

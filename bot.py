@@ -141,6 +141,8 @@ class VerifyView(discord.ui.View):
 WELCOME_CHANNEL_NAME = "welcome"
 PARTNERSHIP_CHANNEL_NAME = "partnership"
 partnership_submissions = {}
+MODERATOR_ROLE_NAME = "Moderator"
+moderator_submissions = {}  # temp storage: submission_id -> data
 ALLOWED_YOUTUBE_CHANNEL = "youtube-upload"
 YOUTUBE_PATTERNS = ["youtube.com", "youtu.be"]
 
@@ -231,7 +233,9 @@ async def on_ready():
     logger.info(f"Bot login sebagai {bot.user} (latency: {bot_status['latency_ms']}ms)")
     bot.add_view(VerifyView())  # Register persistent view supaya tombol tetap jalan setelah restart
     bot.add_view(RoleSelectView())
-    bot.add_view(PartnershipRequestView())  # Register persistent view untuk role select menu
+    bot.add_view(PartnershipRequestView())
+    bot.add_view(ModeratorSignupRequestView())
+    bot.add_view(ContentCreatorRequestView())  # Register persistent view untuk role select menu
     try:
         synced = await bot.tree.sync()
         logger.info(f"{len(synced)} slash command(s) synced")
@@ -514,6 +518,7 @@ class PartnershipModal(discord.ui.Modal, title="Partnership Request"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         submission_id = str(uuid.uuid4())[:8]
         partnership_submissions[submission_id] = {
             "requester_id": interaction.user.id,
@@ -554,6 +559,48 @@ class PartnershipRequestView(discord.ui.View):
         await interaction.response.send_modal(PartnershipModal())
 
 
+class PartnershipDenyReasonModal(discord.ui.Modal, title="Denial Reason"):
+    reason = discord.ui.TextInput(
+        label="Reason for denying (sent to requester)",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500
+    )
+
+    def __init__(self, submission_id: str, original_message: discord.Message):
+        super().__init__()
+        self.submission_id = submission_id
+        self.original_message = original_message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        data = partnership_submissions.get(self.submission_id)
+        if not data:
+            await interaction.response.send_message("\u26a0 This request was already handled or expired.", ephemeral=True)
+            return
+
+        reason = str(self.reason)
+
+        await self.original_message.edit(
+            content=f"\u274c **DENIED** by Dev.\nReason: {reason}",
+            embed=self.original_message.embeds[0],
+            view=None
+        )
+        await interaction.response.send_message("\u2705 Denial sent.", ephemeral=True)
+
+        channel = interaction.client.get_channel(data["channel_id"])
+        requester_mention = f"<@{data['requester_id']}>"
+
+        if channel:
+            try:
+                await channel.send(
+                    f"{requester_mention} Your partnership request has been **DENIED** by the Dev.\nReason: {reason}"
+                )
+            except discord.Forbidden:
+                pass
+
+        del partnership_submissions[self.submission_id]
+
+
 class PartnershipDecisionView(discord.ui.View):
     def __init__(self, submission_id: str):
         super().__init__(timeout=None)
@@ -563,39 +610,38 @@ class PartnershipDecisionView(discord.ui.View):
 
     @discord.ui.button(label="ACCEPT", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._resolve(interaction, approved=True)
-
-    @discord.ui.button(label="DENIED", style=discord.ButtonStyle.danger)
-    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._resolve(interaction, approved=False)
-
-    async def _resolve(self, interaction: discord.Interaction, approved: bool):
         data = partnership_submissions.get(self.submission_id)
         if not data:
             await interaction.response.edit_message(content="\u26a0 This request was already handled or expired.", embed=None, view=None)
             return
 
-        result_text = "\u2705 **ACCEPTED**" if approved else "\u274c **DENIED**"
-        await interaction.response.edit_message(content=f"{result_text} by Dev.", embed=interaction.message.embeds[0], view=None)
+        await interaction.response.edit_message(
+            content="\u2705 **ACCEPTED** by Dev.",
+            embed=interaction.message.embeds[0],
+            view=None
+        )
 
         channel = interaction.client.get_channel(data["channel_id"])
         requester_mention = f"<@{data['requester_id']}>"
 
         if channel:
             try:
-                if approved:
-                    await channel.send(
-                        f"{requester_mention} \U0001f389 Your partnership request has been **ACCEPTED** by the Dev! "
-                        f"We'll be in touch about next steps."
-                    )
-                else:
-                    await channel.send(
-                        f"{requester_mention} Your partnership request has been **DENIED** by the Dev."
-                    )
+                await channel.send(
+                    f"{requester_mention} \U0001f389 Your partnership request has been **ACCEPTED** by the Dev! "
+                    f"We'll be in touch about next steps."
+                )
             except discord.Forbidden:
                 pass
 
         del partnership_submissions[self.submission_id]
+
+    @discord.ui.button(label="DENIED", style=discord.ButtonStyle.danger)
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = partnership_submissions.get(self.submission_id)
+        if not data:
+            await interaction.response.edit_message(content="\u26a0 This request was already handled or expired.", embed=None, view=None)
+            return
+        await interaction.response.send_modal(PartnershipDenyReasonModal(self.submission_id, interaction.message))
 
 
 @bot.tree.command(name="setup_partnership", description="Send the partnership request message (admin only)")
@@ -616,6 +662,382 @@ async def setup_partnership(interaction: discord.Interaction):
 
 @setup_partnership.error
 async def setup_partnership_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("\u26a0 You don't have permission to run this command.", ephemeral=True)
+
+
+class ModeratorSignupModal(discord.ui.Modal, title="Moderator Sign Up"):
+    q1 = discord.ui.TextInput(
+        label="Why do you want to become a Moderator?",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500
+    )
+    q2 = discord.ui.TextInput(
+        label="Most important 2-3 rules & why?",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500
+    )
+    q3 = discord.ui.TextInput(
+        label="Handling repeat offenders/NSFW/toxicity?",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=1000
+    )
+    q4 = discord.ui.TextInput(
+        label="Comfortable w/ mod tools? Punishing a friend?",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=1000
+    )
+    q5 = discord.ui.TextInput(
+        label="Anything else staff should know? (optional)",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=500
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        submission_id = str(uuid.uuid4())[:8]
+        moderator_submissions[submission_id] = {
+            "requester_id": interaction.user.id,
+            "guild_id": interaction.guild.id,
+            "channel_id": interaction.channel.id,
+            "answers": {
+                "Why become a Moderator?": str(self.q1),
+                "Most important rules & why?": str(self.q2),
+                "Handling repeat offenders/NSFW/toxicity?": str(self.q3),
+                "Mod tools comfort / punishing a friend?": str(self.q4),
+                "Anything else?": str(self.q5) if self.q5.value else "None provided",
+            }
+        }
+
+        dev = interaction.client.get_user(DEV_USER_ID) or await interaction.client.fetch_user(DEV_USER_ID)
+
+        embed = discord.Embed(title="\U0001f6e1 New Moderator Application", color=0xFFA500)
+        embed.add_field(name="Applicant", value=f"{interaction.user.mention} ({interaction.user})", inline=False)
+        for question, answer in moderator_submissions[submission_id]["answers"].items():
+            embed.add_field(name=question, value=answer[:1024], inline=False)
+        embed.set_footer(text=f"Submission ID: {submission_id}")
+
+        try:
+            await dev.send(embed=embed, view=ModeratorDecisionView(submission_id))
+            await interaction.response.send_message(
+                "\u2705 Your moderator application has been sent to the Dev for review!",
+                ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "\u26a0 Couldn't reach the Dev's DMs. Please contact them directly.",
+                ephemeral=True
+            )
+
+
+class ModeratorSignupRequestView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="\U0001f6e1 Sign Up Moderator", style=discord.ButtonStyle.primary, custom_id="moderator_signup_button")
+    async def signup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ModeratorSignupModal())
+
+
+class ModeratorDenyReasonModal(discord.ui.Modal, title="Denial Reason"):
+    reason = discord.ui.TextInput(
+        label="Reason for denying (sent to applicant)",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500
+    )
+
+    def __init__(self, submission_id: str, original_message: discord.Message):
+        super().__init__()
+        self.submission_id = submission_id
+        self.original_message = original_message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        data = moderator_submissions.get(self.submission_id)
+        if not data:
+            await interaction.response.send_message("\u26a0 This application was already handled or expired.", ephemeral=True)
+            return
+
+        reason = str(self.reason)
+
+        await self.original_message.edit(
+            content=f"\u274c **DENIED** by Dev.\nReason: {reason}",
+            embed=self.original_message.embeds[0],
+            view=None
+        )
+        await interaction.response.send_message("\u2705 Denial sent.", ephemeral=True)
+
+        channel = interaction.client.get_channel(data["channel_id"])
+        requester_mention = f"<@{data['requester_id']}>"
+
+        if channel:
+            try:
+                await channel.send(
+                    f"{requester_mention} Your moderator application has been **DENIED** by the Dev.\nReason: {reason}"
+                )
+            except discord.Forbidden:
+                pass
+
+        del moderator_submissions[self.submission_id]
+
+
+class ModeratorDecisionView(discord.ui.View):
+    def __init__(self, submission_id: str):
+        super().__init__(timeout=None)
+        self.submission_id = submission_id
+        self.children[0].custom_id = f"mod_promote_{submission_id}"
+        self.children[1].custom_id = f"mod_deny_{submission_id}"
+
+    @discord.ui.button(label="PROMOTE", style=discord.ButtonStyle.success)
+    async def promote(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        data = moderator_submissions.get(self.submission_id)
+        if not data:
+            await interaction.edit_original_response(content="\u26a0 This application was already handled or expired.", embed=None, view=None)
+            return
+
+        guild = interaction.client.get_guild(data["guild_id"])
+        member = guild.get_member(data["requester_id"]) if guild else None
+        channel = interaction.client.get_channel(data["channel_id"])
+        requester_mention = f"<@{data['requester_id']}>"
+
+        role_granted = False
+        if member and guild:
+            role = discord.utils.get(guild.roles, name=MODERATOR_ROLE_NAME)
+            if role:
+                try:
+                    await member.add_roles(role, reason="Promoted via moderator application")
+                    role_granted = True
+                except discord.Forbidden:
+                    pass
+
+        result_text = "\u2705 **PROMOTED**" if role_granted else "\u2705 **PROMOTED** (\u26a0 role assignment failed \u2014 check bot permissions/role hierarchy)"
+        await interaction.edit_original_response(content=f"{result_text} by Dev.", embed=interaction.message.embeds[0], view=None)
+
+        if channel:
+            try:
+                await channel.send(
+                    f"{requester_mention} \U0001f389 Congratulations! You've been **PROMOTED** to Moderator!"
+                )
+            except discord.Forbidden:
+                pass
+
+        del moderator_submissions[self.submission_id]
+
+    @discord.ui.button(label="DENIED", style=discord.ButtonStyle.danger)
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = moderator_submissions.get(self.submission_id)
+        if not data:
+            await interaction.response.edit_message(content="\u26a0 This application was already handled or expired.", embed=None, view=None)
+            return
+        await interaction.response.send_modal(ModeratorDenyReasonModal(self.submission_id, interaction.message))
+
+
+@bot.tree.command(name="setup_moderator_signup", description="Send the moderator sign-up message (admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_moderator_signup(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="\U0001f6e1 Become a Moderator",
+        description=(
+            "Interested in helping moderate **3DRBXMT**?\n\n"
+            "Click the button below and answer a few questions. The Dev will review "
+            "your application and you'll get a result here."
+        ),
+        color=0xFFA500
+    )
+    embed.set_footer(text="3DRBXMT \u00b7 Staff Applications")
+    await interaction.channel.send(embed=embed, view=ModeratorSignupRequestView())
+    await interaction.response.send_message("\u2713 Moderator sign-up message sent!", ephemeral=True)
+
+@setup_moderator_signup.error
+async def setup_moderator_signup_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("\u26a0 You don't have permission to run this command.", ephemeral=True)
+
+
+CONTENT_CREATOR_ROLE_NAME = "Content Creator"
+content_creator_submissions = {}  # temp storage: submission_id -> data
+
+
+class ContentCreatorModal(discord.ui.Modal, title="Content Creator Sign Up"):
+    channel_name = discord.ui.TextInput(
+        label="Name of the channel",
+        required=True,
+        max_length=100
+    )
+    channel_link = discord.ui.TextInput(
+        label="Link Channel YouTube",
+        placeholder="https://youtube.com/@yourchannel",
+        required=True,
+        max_length=200
+    )
+    about = discord.ui.TextInput(
+        label="About This YouTube Channel (Optional)",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=500
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        submission_id = str(uuid.uuid4())[:8]
+        content_creator_submissions[submission_id] = {
+            "requester_id": interaction.user.id,
+            "guild_id": interaction.guild.id,
+            "channel_id": interaction.channel.id,
+            "channel_name": str(self.channel_name),
+            "channel_link": str(self.channel_link),
+            "about": str(self.about) if self.about.value else "None provided",
+        }
+
+        dev = interaction.client.get_user(DEV_USER_ID) or await interaction.client.fetch_user(DEV_USER_ID)
+
+        embed = discord.Embed(title="\U0001f3ac New Content Creator Application", color=0xFF0000)
+        embed.add_field(name="Applicant", value=f"{interaction.user.mention} ({interaction.user})", inline=False)
+        embed.add_field(name="Channel Name", value=content_creator_submissions[submission_id]["channel_name"], inline=False)
+        embed.add_field(name="Channel Link", value=content_creator_submissions[submission_id]["channel_link"], inline=False)
+        embed.add_field(name="About", value=content_creator_submissions[submission_id]["about"], inline=False)
+        embed.set_footer(text=f"Submission ID: {submission_id}")
+
+        try:
+            await dev.send(embed=embed, view=ContentCreatorDecisionView(submission_id))
+            await interaction.followup.send(
+                "\u2705 Your Content Creator application has been sent to the Dev for review!",
+                ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "\u26a0 Couldn't reach the Dev's DMs. Please contact them directly.",
+                ephemeral=True
+            )
+
+
+class ContentCreatorRequestView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="\U0001f3ac Content Creator", style=discord.ButtonStyle.primary, custom_id="content_creator_signup_button")
+    async def signup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ContentCreatorModal())
+
+
+class ContentCreatorDenyReasonModal(discord.ui.Modal, title="Denial Reason"):
+    reason = discord.ui.TextInput(
+        label="Reason for denying (sent to applicant)",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500
+    )
+
+    def __init__(self, submission_id: str, original_message: discord.Message):
+        super().__init__()
+        self.submission_id = submission_id
+        self.original_message = original_message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        data = content_creator_submissions.get(self.submission_id)
+        if not data:
+            await interaction.response.send_message("\u26a0 This application was already handled or expired.", ephemeral=True)
+            return
+
+        reason = str(self.reason)
+
+        await self.original_message.edit(
+            content=f"\u274c **DENIED** by Dev.\nReason: {reason}",
+            embed=self.original_message.embeds[0],
+            view=None
+        )
+        await interaction.response.send_message("\u2705 Denial sent.", ephemeral=True)
+
+        channel = interaction.client.get_channel(data["channel_id"])
+        requester_mention = f"<@{data['requester_id']}>"
+
+        if channel:
+            try:
+                await channel.send(
+                    f"{requester_mention} Your Content Creator application has been **DENIED** by the Dev.\nReason: {reason}"
+                )
+            except discord.Forbidden:
+                pass
+
+        del content_creator_submissions[self.submission_id]
+
+
+class ContentCreatorDecisionView(discord.ui.View):
+    def __init__(self, submission_id: str):
+        super().__init__(timeout=None)
+        self.submission_id = submission_id
+        self.children[0].custom_id = f"creator_promote_{submission_id}"
+        self.children[1].custom_id = f"creator_deny_{submission_id}"
+
+    @discord.ui.button(label="PROMOTE", style=discord.ButtonStyle.success)
+    async def promote(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        data = content_creator_submissions.get(self.submission_id)
+        if not data:
+            await interaction.edit_original_response(content="\u26a0 This application was already handled or expired.", embed=None, view=None)
+            return
+
+        guild = interaction.client.get_guild(data["guild_id"])
+        member = guild.get_member(data["requester_id"]) if guild else None
+        channel = interaction.client.get_channel(data["channel_id"])
+        requester_mention = f"<@{data['requester_id']}>"
+
+        role_granted = False
+        if member and guild:
+            role = discord.utils.get(guild.roles, name=CONTENT_CREATOR_ROLE_NAME)
+            if role:
+                try:
+                    await member.add_roles(role, reason="Promoted via Content Creator application")
+                    role_granted = True
+                except discord.Forbidden:
+                    pass
+
+        result_text = "\u2705 **PROMOTED**" if role_granted else "\u2705 **PROMOTED** (\u26a0 role assignment failed \u2014 check bot permissions/role hierarchy)"
+        await interaction.edit_original_response(content=f"{result_text} by Dev.", embed=interaction.message.embeds[0], view=None)
+
+        if channel:
+            try:
+                await channel.send(
+                    f"{requester_mention} \U0001f389 Congratulations! You've been **PROMOTED** to Content Creator!"
+                )
+            except discord.Forbidden:
+                pass
+
+        del content_creator_submissions[self.submission_id]
+
+    @discord.ui.button(label="DENIED", style=discord.ButtonStyle.danger)
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = content_creator_submissions.get(self.submission_id)
+        if not data:
+            await interaction.response.edit_message(content="\u26a0 This application was already handled or expired.", embed=None, view=None)
+            return
+        await interaction.response.send_modal(ContentCreatorDenyReasonModal(self.submission_id, interaction.message))
+
+
+@bot.tree.command(name="setup_content_creator", description="Send the Content Creator sign-up message (admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_content_creator(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="\U0001f3ac Become a Content Creator",
+        description=(
+            "Create YouTube content related to **3DRBXMT**?\n\n"
+            "Click the button below and tell us about your channel. The Dev will review "
+            "your application and you'll get a result here."
+        ),
+        color=0xFF0000
+    )
+    embed.set_footer(text="3DRBXMT \u00b7 Content Creator Applications")
+    await interaction.channel.send(embed=embed, view=ContentCreatorRequestView())
+    await interaction.response.send_message("\u2713 Content Creator sign-up message sent!", ephemeral=True)
+
+@setup_content_creator.error
+async def setup_content_creator_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("\u26a0 You don't have permission to run this command.", ephemeral=True)
 
@@ -914,6 +1336,8 @@ async def help_command(interaction: discord.Interaction):
             "`/serverstats` — View server statistics\n"
             "`/botinfo` — View bot info (ping, uptime)\n"
             "`/help` — Show this command list"
+            "🤝 **Partnership** button — Submit a partnership request\n"
+            "🛡 **Sign Up Moderator** button — Apply to become a Moderator"
         ),
         inline=False
     )
@@ -942,6 +1366,8 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "`/setup_verify` — Send the verification message\n"
             "`/setup_roles` — Send the self-role selection menu\n"
+            "`/setup_partnership` — Send the partnership request message\n"
+            "`/setup_moderator_signup` — Send the moderator sign-up message\n"
             "`/announce` — Send an announcement to #announcement\n"
             "`/statusweb` toggle buttons — Change website status\n\n"
             "**🔴 Dev Only (restricted to a single User ID):**\n"
