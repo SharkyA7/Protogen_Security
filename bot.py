@@ -1420,6 +1420,118 @@ async def warnings_cmd_error(interaction: discord.Interaction, error):
         await interaction.response.send_message("⚠ You don't have permission to run this command.", ephemeral=True)
 
 
+def get_dev_info(user_id):
+    """Fetches a saved /addinfo profile for a user. Returns dict or None."""
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/dev_info",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}"
+            },
+            params={"user_id": f"eq.{user_id}", "select": "name,age,language,about"},
+            timeout=5
+        )
+        if r.status_code == 200:
+            data = r.json()
+            return data[0] if data else None
+        return None
+    except Exception:
+        return None
+
+
+def upsert_dev_info(user_id, name, age, language, about):
+    """Creates or overwrites a user's /addinfo profile. Requires a unique constraint
+    on user_id in the dev_info table for the upsert to merge correctly."""
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/dev_info",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates"
+            },
+            params={"on_conflict": "user_id"},
+            json={
+                "user_id": str(user_id),
+                "name": name,
+                "age": age,
+                "language": language,
+                "about": about
+            },
+            timeout=5
+        )
+        return r.status_code in (200, 201)
+    except Exception:
+        return False
+
+
+class AddInfoModal(discord.ui.Modal, title="Set Your Dev Info"):
+    name = discord.ui.TextInput(label="Name", placeholder="What should we call you?", max_length=100)
+    age = discord.ui.TextInput(label="Age", placeholder="e.g. 21", max_length=10)
+    language = discord.ui.TextInput(label="Language", placeholder="e.g. Python, Lua, JavaScript", max_length=100)
+    about = discord.ui.TextInput(
+        label="About",
+        style=discord.TextStyle.paragraph,
+        placeholder="Tell us a bit about yourself...",
+        max_length=500,
+        required=False
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        success = upsert_dev_info(
+            interaction.user.id,
+            self.name.value,
+            self.age.value,
+            self.language.value,
+            self.about.value or "—"
+        )
+        if success:
+            await interaction.response.send_message(
+                "✅ Your info has been saved! Check it anytime with `/devinfo`.",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                "⚠ Something went wrong saving your info. Try again in a moment.",
+                ephemeral=True
+            )
+
+
+@bot.tree.command(name="addinfo", description="Fill in your dev info (name, age, language, about)")
+async def addinfo(interaction: discord.Interaction):
+    await interaction.response.send_modal(AddInfoModal())
+
+
+@bot.tree.command(name="devinfo", description="View a member's dev info")
+@app_commands.describe(member="Whose info to view (defaults to you)")
+async def devinfo(interaction: discord.Interaction, member: discord.Member = None):
+    target = member or interaction.user
+    info = get_dev_info(target.id)
+
+    if info is None:
+        if target.id == interaction.user.id:
+            await interaction.response.send_message(
+                "You haven't set your info yet — use `/addinfo` to fill it in!",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"{target.mention} hasn't set their info yet.",
+                ephemeral=True
+            )
+        return
+
+    embed = discord.Embed(title=f"📇 {target.display_name}'s Dev Info", color=0x00D4FF)
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name="Name", value=info.get("name") or "—", inline=True)
+    embed.add_field(name="Age", value=info.get("age") or "—", inline=True)
+    embed.add_field(name="Language", value=info.get("language") or "—", inline=True)
+    embed.add_field(name="About", value=info.get("about") or "—", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
 # ── SERVER STATS & BOT INFO ────────────────────────────────
 
 @bot.tree.command(name="serverstats", description="Show server statistics")
@@ -1537,9 +1649,11 @@ async def help_command(interaction: discord.Interaction):
             "`/checkproto` — Check if the bot is online\n"
             "`/statusweb` — Check website status (live/maintenance)\n"
             "`/myinfo [member]` — View your or another member's info & warnings\n"
+            "`/addinfo` — Fill in your dev info (name, age, language, about)\n"
+            "`/devinfo [member]` — View your or another member's dev info\n"
             "`/serverstats` — View server statistics\n"
             "`/botinfo` — View bot info (ping, uptime)\n"
-            "`/help` — Show this command list"
+            "`/help` — Show this command list\n"
             "🤝 **Partnership** button — Submit a partnership request\n"
             "🛡 **Sign Up Moderator** button — Apply to become a Moderator"
         ),
