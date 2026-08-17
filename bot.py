@@ -216,7 +216,9 @@ def is_privileged_member(member: discord.Member) -> bool:
 
 
 async def lock_guild(guild: discord.Guild) -> int:
-    """Denies send_messages for @everyone in every text channel. Returns count locked."""
+    """Denies send_messages for @everyone in every text channel. Returns count locked.
+    Channels that were already restricted before lockdown are left untouched and not
+    tracked, so /raidunlock won't reopen something that was meant to stay locked."""
     locked = 0
     for channel in guild.text_channels:
         try:
@@ -224,8 +226,8 @@ async def lock_guild(guild: discord.Guild) -> int:
             if overwrite.send_messages is not False:
                 overwrite.send_messages = False
                 await channel.set_permissions(guild.default_role, overwrite=overwrite)
+                _raid_locked_channels[guild.id].add(channel.id)
                 locked += 1
-            _raid_locked_channels[guild.id].add(channel.id)
         except discord.Forbidden:
             continue
     _raid_mode_active[guild.id] = True
@@ -233,7 +235,7 @@ async def lock_guild(guild: discord.Guild) -> int:
 
 
 async def unlock_guild(guild: discord.Guild) -> int:
-    """Reverses lock_guild() for channels it locked. Returns count unlocked."""
+    """Reverses lock_guild() only for channels it actually locked. Returns count unlocked."""
     unlocked = 0
     for channel_id in list(_raid_locked_channels[guild.id]):
         channel = guild.get_channel(channel_id)
