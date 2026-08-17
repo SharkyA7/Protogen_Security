@@ -3,9 +3,11 @@ import re
 import time
 import asyncio
 import logging
+import datetime
 import threading
 import requests
 import discord
+from collections import deque, defaultdict
 from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
@@ -162,11 +164,144 @@ def has_invite_permission(member: discord.Member) -> bool:
     return False
 
 
+# ── ANTI-RAID / AUTOMOD ──────────────────────────────────────
+# Alerts are posted to a text channel named MOD_LOG_CHANNEL_NAME, if it exists.
+MOD_LOG_CHANNEL_NAME = "mod-log"
+
+# Mass-join (raid) detection
+RAID_JOIN_THRESHOLD = 6          # this many joins...
+RAID_JOIN_WINDOW_SECONDS = 15    # ...within this many seconds triggers auto-lockdown
+
+# Message spam automod
+# Mass-mention / link-spam automod (targets raid-style @everyone / mass-ping / link-flood
+# behavior, not just typing fast — someone explaining something across several messages
+# with normal content is never flagged)
+SPAM_MENTION_SINGLE_THRESHOLD = 5    # mentions in a single message
+SPAM_MENTION_WINDOW_SECONDS = 6
+SPAM_MENTION_WINDOW_THRESHOLD = 8    # mentions+links summed across the window
+SPAM_TIMEOUT_MINUTES = 10
+
+URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
+
+_join_timestamps = defaultdict(deque)       # guild_id -> deque[float]
+_message_timestamps = defaultdict(deque)    # (guild_id, user_id) -> deque[(float, int)] (time, mention+link count)
+_raid_locked_channels = defaultdict(set)    # guild_id -> set[channel_id] locked by auto/manual raid response
+_raid_mode_active = defaultdict(bool)       # guild_id -> bool
+_known_webhooks = defaultdict(set)          # guild_id -> set[webhook_id]
+
+
+def get_mod_log_channel(guild: discord.Guild):
+    return discord.utils.get(guild.text_channels, name=MOD_LOG_CHANNEL_NAME)
+
+
+async def alert_mods(guild: discord.Guild, embed: discord.Embed):
+    channel = get_mod_log_channel(guild)
+    if channel is None:
+        return
+    try:
+        await channel.send(embed=embed)
+    except discord.Forbidden:
+        pass
+
+
+def is_privileged_member(member: discord.Member) -> bool:
+    """Members who should be exempt from automod (mods/admins/dev/protected roles)."""
+    if member.id == DEV_USER_ID:
+        return True
+    if member.guild_permissions.administrator or member.guild_permissions.manage_messages:
+        return True
+    if any(r.name in PROTECTED_ROLES for r in member.roles):
+        return True
+    return False
+
+
+async def lock_guild(guild: discord.Guild) -> int:
+    """Denies send_messages for @everyone in every text channel. Returns count locked."""
+    locked = 0
+    for channel in guild.text_channels:
+        try:
+            overwrite = channel.overwrites_for(guild.default_role)
+            if overwrite.send_messages is not False:
+                overwrite.send_messages = False
+                await channel.set_permissions(guild.default_role, overwrite=overwrite)
+                locked += 1
+            _raid_locked_channels[guild.id].add(channel.id)
+        except discord.Forbidden:
+            continue
+    _raid_mode_active[guild.id] = True
+    return locked
+
+
+async def unlock_guild(guild: discord.Guild) -> int:
+    """Reverses lock_guild() for channels it locked. Returns count unlocked."""
+    unlocked = 0
+    for channel_id in list(_raid_locked_channels[guild.id]):
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            continue
+        try:
+            overwrite = channel.overwrites_for(guild.default_role)
+            overwrite.send_messages = None
+            await channel.set_permissions(guild.default_role, overwrite=overwrite)
+            unlocked += 1
+        except discord.Forbidden:
+            continue
+    _raid_locked_channels[guild.id].clear()
+    _raid_mode_active[guild.id] = False
+    return unlocked
+
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
+
+    # ── Mass-mention / link-spam automod ──
+    if message.guild is not None and not is_privileged_member(message.author):
+        mention_count = len(message.mentions) + len(message.role_mentions)
+        if message.mention_everyone:
+            mention_count += 5  # an unauthorized @everyone/@here ping is a strong signal on its own
+        link_count = len(URL_PATTERN.findall(message.content))
+        this_message_total = mention_count + link_count
+
+        now = time.time()
+        key = (message.guild.id, message.author.id)
+        dq = _message_timestamps[key]
+        dq.append((now, this_message_total))
+        while dq and now - dq[0][0] > SPAM_MENTION_WINDOW_SECONDS:
+            dq.popleft()
+        window_total = sum(count for _, count in dq)
+
+        if mention_count >= SPAM_MENTION_SINGLE_THRESHOLD or window_total >= SPAM_MENTION_WINDOW_THRESHOLD:
+            dq.clear()
+            member = message.author
+            try:
+                await member.timeout(
+                    datetime.timedelta(minutes=SPAM_TIMEOUT_MINUTES),
+                    reason="Automod: mass mentions/links"
+                )
+            except discord.Forbidden:
+                pass
+            try:
+                warning = await message.channel.send(
+                    f"🔇 {member.mention} was timed out for {SPAM_TIMEOUT_MINUTES} minute(s) — mass mentions/links detected."
+                )
+                await warning.delete(delay=8)
+            except discord.Forbidden:
+                pass
+            await alert_mods(
+                message.guild,
+                discord.Embed(
+                    title="🔇 Automod: Mass Mention/Link Timeout",
+                    description=(
+                        f"{member.mention} (`{member.id}`) triggered automod in {message.channel.mention} "
+                        f"(mentions: {mention_count}, links: {link_count}, "
+                        f"{SPAM_MENTION_WINDOW_SECONDS}s window total: {window_total})."
+                    ),
+                    color=0xFFA500
+                )
+            )
+            return
 
     if DISCORD_INVITE_PATTERN.search(message.content) and not has_invite_permission(message.author):
         try:
@@ -200,6 +335,31 @@ async def on_message(message):
 
 @bot.event
 async def on_member_join(member):
+    # ── Mass-join (raid) detection ──
+    now = time.time()
+    dq = _join_timestamps[member.guild.id]
+    dq.append(now)
+    while dq and now - dq[0] > RAID_JOIN_WINDOW_SECONDS:
+        dq.popleft()
+
+    if len(dq) >= RAID_JOIN_THRESHOLD and not _raid_mode_active[member.guild.id]:
+        locked = await lock_guild(member.guild)
+        embed = discord.Embed(
+            title="🚨 Possible Raid Detected",
+            description=(
+                f"{len(dq)} members joined within {RAID_JOIN_WINDOW_SECONDS}s.\n"
+                f"Auto-locked {locked} channel(s). Run `/raidunlock` once it's safe to reopen."
+            ),
+            color=0xFF0000
+        )
+        embed.add_field(name="Most recent joiner", value=f"{member.mention} (`{member.id}`)", inline=False)
+        embed.add_field(
+            name="Account created",
+            value=discord.utils.format_dt(member.created_at, style="R"),
+            inline=False
+        )
+        await alert_mods(member.guild, embed)
+
     channel = discord.utils.get(member.guild.text_channels, name=WELCOME_CHANNEL_NAME)
     if channel is None:
         return
@@ -241,6 +401,48 @@ async def on_ready():
         logger.info(f"{len(synced)} slash command(s) synced")
     except Exception as e:
         logger.error(f"Gagal sync commands: {e}")
+
+    # Snapshot existing webhooks so we only alert on newly created ones later
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            try:
+                whs = await channel.webhooks()
+                _known_webhooks[guild.id].update(wh.id for wh in whs)
+            except discord.Forbidden:
+                continue
+
+
+@bot.event
+async def on_webhooks_update(channel):
+    """Alerts mods when a new webhook appears — a common raid/spam persistence trick."""
+    guild = channel.guild
+    try:
+        current_webhooks = await channel.webhooks()
+    except discord.Forbidden:
+        return
+
+    current_ids = {wh.id for wh in current_webhooks}
+    known_ids = _known_webhooks[guild.id]
+    new_ids = current_ids - known_ids
+
+    for wh in current_webhooks:
+        if wh.id in new_ids:
+            creator = str(wh.user) if wh.user else "Unknown (bot may lack Manage Webhooks to see creator)"
+            await alert_mods(
+                guild,
+                discord.Embed(
+                    title="⚠ New Webhook Created",
+                    description=(
+                        f"A webhook named **{wh.name}** was created in {channel.mention}.\n"
+                        f"Created by: {creator}\n\n"
+                        f"If you don't recognize this, delete it — webhooks are a common way "
+                        f"raiders keep posting even after being banned."
+                    ),
+                    color=0xFFA500
+                )
+            )
+
+    _known_webhooks[guild.id] = current_ids
 
 
 @bot.event
@@ -1362,6 +1564,17 @@ async def help_command(interaction: discord.Interaction):
     )
 
     embed.add_field(
+        name="🚨 Raid Response (Admin Only)",
+        value=(
+            "`/raidlockdown` — Lock every channel server-wide\n"
+            "`/raidunlock` — Reverse a server-wide lockdown\n\n"
+            "Also automatic: mass-join auto-lockdown, mass-mention/link-spam auto-timeout, "
+            "and new-webhook alerts — all posted to a `#mod-log` channel if one exists."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
         name="👑 Admin/Dev Only",
         value=(
             "`/setup_verify` — Send the verification message\n"
@@ -1456,6 +1669,42 @@ async def unlock(interaction: discord.Interaction):
 
 @unlock.error
 async def unlock_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("⚠ You don't have permission to run this command.", ephemeral=True)
+
+
+@bot.tree.command(name="raidlockdown", description="EMERGENCY: lock every text channel server-wide (admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def raidlockdown(interaction: discord.Interaction):
+    await interaction.response.defer()
+    locked = await lock_guild(interaction.guild)
+    await interaction.followup.send(f"🚨 Server-wide lockdown activated. {locked} channel(s) locked.")
+    await alert_mods(
+        interaction.guild,
+        discord.Embed(
+            title="🚨 Server Lockdown Activated",
+            description=f"Triggered manually by {interaction.user.mention}. {locked} channel(s) locked.",
+            color=0xFF0000
+        )
+    )
+
+
+@raidlockdown.error
+async def raidlockdown_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("⚠ You don't have permission to run this command.", ephemeral=True)
+
+
+@bot.tree.command(name="raidunlock", description="Reverse a server-wide raid lockdown (admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def raidunlock(interaction: discord.Interaction):
+    await interaction.response.defer()
+    unlocked = await unlock_guild(interaction.guild)
+    await interaction.followup.send(f"✅ Lockdown lifted. {unlocked} channel(s) unlocked.")
+
+
+@raidunlock.error
+async def raidunlock_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("⚠ You don't have permission to run this command.", ephemeral=True)
 
