@@ -1462,8 +1462,11 @@ def upsert_dev_info(user_id, name, age, language, about):
             },
             timeout=5
         )
+        if r.status_code not in (200, 201):
+            logger.error(f"upsert_dev_info failed: status={r.status_code} body={r.text}")
         return r.status_code in (200, 201)
-    except Exception:
+    except Exception as e:
+        logger.error(f"upsert_dev_info exception: {e}")
         return False
 
 
