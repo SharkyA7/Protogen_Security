@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import time
 import asyncio
 import logging
@@ -215,7 +216,7 @@ def _groq_chat_sync(user_message: str) -> str:
             {"role": "system", "content": AI_SYSTEM_PROMPT},
             {"role": "user", "content": user_message[:AI_MAX_HISTORY_CHARS]}
         ],
-        max_tokens=500,
+        max_tokens=1500,
         temperature=0.7
     )
     return completion.choices[0].message.content
@@ -229,6 +230,51 @@ async def generate_ai_reply(user_message: str) -> str:
     except Exception as e:
         logger.error(f"Groq chat error: {e}")
         return "⚠ Sorry, I couldn't get a response right now — try again in a moment."
+
+
+CODE_BLOCK_PATTERN = re.compile(r"```(\w*)\n(.*?)```", re.DOTALL)
+LANG_TO_EXT = {
+    "python": "py", "py": "py", "javascript": "js", "js": "js",
+    "typescript": "ts", "ts": "ts", "lua": "lua", "html": "html",
+    "css": "css", "java": "java", "c": "c", "cpp": "cpp", "c++": "cpp",
+    "json": "json", "bash": "sh", "sh": "sh", "shell": "sh",
+    "sql": "sql", "go": "go", "rust": "rs", "yaml": "yaml", "yml": "yaml"
+}
+
+
+async def send_ai_reply(message: discord.Message, reply_text: str):
+    """Sends an AI reply, extracting fenced code blocks into file attachments
+    (Discord has no collapsible code panel, so a downloadable file is the
+    closest equivalent) and splitting long plain text to stay under the
+    2000-character message limit."""
+    blocks = CODE_BLOCK_PATTERN.findall(reply_text)
+
+    if blocks:
+        remaining_text = CODE_BLOCK_PATTERN.sub("", reply_text).strip()
+        files = []
+        for i, (lang, code) in enumerate(blocks, start=1):
+            ext = LANG_TO_EXT.get(lang.lower().strip(), "txt")
+            filename = f"code_{i}.{ext}" if len(blocks) > 1 else f"code.{ext}"
+            files.append(discord.File(io.BytesIO(code.strip().encode("utf-8")), filename=filename))
+
+        caption = remaining_text if remaining_text else "Here's the code:"
+        if len(caption) > 2000:
+            caption = caption[:1997] + "..."
+        await message.reply(caption, files=files, mention_author=False)
+        return
+
+    if len(reply_text) <= 2000:
+        await message.reply(reply_text, mention_author=False)
+        return
+
+    chunks = [reply_text[i:i + 1990] for i in range(0, len(reply_text), 1990)]
+    first = True
+    for chunk in chunks:
+        if first:
+            await message.reply(chunk, mention_author=False)
+            first = False
+        else:
+            await message.channel.send(chunk)
 
 
 def get_mod_log_channel(guild: discord.Guild):
@@ -373,7 +419,7 @@ async def on_message(message):
         if clean_content:
             async with message.channel.typing():
                 reply = await generate_ai_reply(clean_content)
-            await message.reply(reply, mention_author=False)
+            await send_ai_reply(message, reply)
             return
 
     if DISCORD_INVITE_PATTERN.search(message.content) and not has_invite_permission(message.author):
