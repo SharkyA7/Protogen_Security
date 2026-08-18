@@ -12,11 +12,13 @@ from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
 from flask import Flask, jsonify
+from groq import Groq
 
 load_dotenv()
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 # ── LOGGING ───────────────────────────────────────────────
 logging.basicConfig(
@@ -190,6 +192,45 @@ _raid_mode_active = defaultdict(bool)       # guild_id -> bool
 _known_webhooks = defaultdict(set)          # guild_id -> set[webhook_id]
 
 
+# ── AI CHAT (Groq / Llama 4 Scout) ───────────────────────────
+AI_CHAT_CHANNEL_NAME = "ai-chat"
+GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+AI_SYSTEM_PROMPT = (
+    "You are a friendly, helpful assistant chatting in a Discord server. "
+    "Keep replies warm, clear, and reasonably concise (a few sentences unless more detail is truly needed). "
+    "Avoid Discord markdown headers; plain conversational text is fine."
+)
+AI_MAX_HISTORY_CHARS = 800  # trims the user's message if it's excessively long
+
+_ai_chat_enabled = defaultdict(lambda: True)  # guild_id -> bool, default ON
+
+_groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+
+def _groq_chat_sync(user_message: str) -> str:
+    """Blocking call to Groq's API — run this off the event loop."""
+    completion = _groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": AI_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message[:AI_MAX_HISTORY_CHARS]}
+        ],
+        max_tokens=500,
+        temperature=0.7
+    )
+    return completion.choices[0].message.content
+
+
+async def generate_ai_reply(user_message: str) -> str:
+    if _groq_client is None:
+        return "⚠ AI chat isn't configured yet — a `GROQ_API_KEY` needs to be set."
+    try:
+        return await asyncio.to_thread(_groq_chat_sync, user_message)
+    except Exception as e:
+        logger.error(f"Groq chat error: {e}")
+        return "⚠ Sorry, I couldn't get a response right now — try again in a moment."
+
+
 def get_mod_log_channel(guild: discord.Guild):
     return discord.utils.get(guild.text_channels, name=MOD_LOG_CHANNEL_NAME)
 
@@ -303,6 +344,36 @@ async def on_message(message):
                     color=0xFFA500
                 )
             )
+            return
+
+    # ── AI chat (mention trigger, restricted to #ai-chat) ──
+    if (
+        message.guild is not None
+        and bot.user in message.mentions
+        and _ai_chat_enabled[message.guild.id]
+    ):
+        if message.channel.name != AI_CHAT_CHANNEL_NAME:
+            target_channel = discord.utils.get(message.guild.text_channels, name=AI_CHAT_CHANNEL_NAME)
+            try:
+                notice = await message.reply(
+                    f"💬 AI chat only works in "
+                    f"{f'<#{target_channel.id}>' if target_channel else f'#{AI_CHAT_CHANNEL_NAME}'} — head over there to chat with me!",
+                    mention_author=False
+                )
+                await notice.delete(delay=8)
+            except discord.Forbidden:
+                pass
+            return
+
+        clean_content = message.content
+        for mention in (f"<@{bot.user.id}>", f"<@!{bot.user.id}>"):
+            clean_content = clean_content.replace(mention, "")
+        clean_content = clean_content.strip()
+
+        if clean_content:
+            async with message.channel.typing():
+                reply = await generate_ai_reply(clean_content)
+            await message.reply(reply, mention_author=False)
             return
 
     if DISCORD_INVITE_PATTERN.search(message.content) and not has_invite_permission(message.author):
@@ -1657,6 +1728,7 @@ async def help_command(interaction: discord.Interaction):
             "`/serverstats` — View server statistics\n"
             "`/botinfo` — View bot info (ping, uptime)\n"
             "`/help` — Show this command list\n"
+            "💬 **Mention the bot in #ai-chat** — Chat with the AI assistant (if enabled)\n"
             "🤝 **Partnership** button — Submit a partnership request\n"
             "🛡 **Sign Up Moderator** button — Apply to become a Moderator"
         ),
@@ -1702,11 +1774,12 @@ async def help_command(interaction: discord.Interaction):
             "`/setup_moderator_signup` — Send the moderator sign-up message\n"
             "`/announce` — Send an announcement to #announcement\n"
             "`/statusweb` toggle buttons — Change website status\n\n"
-            "**🔴 Dev Only (restricted to a single User ID):**\n"
+            "**🔴 Dev Only (restricted to the Dev user or Dev role):**\n"
             "`/dm` — Send a DM to a user as the bot\n"
             "`/broadcast` — Send a message to all channels\n"
             "`/reload` — Resync slash commands\n"
-            "`/shutdown` — Safely shut down the bot"
+            "`/shutdown` — Safely shut down the bot\n"
+            "`/enable` / `/disable` — Turn AI chat on or off"
         ),
         inline=False
     )
@@ -1826,6 +1899,32 @@ async def raidunlock(interaction: discord.Interaction):
 async def raidunlock_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("⚠ You don't have permission to run this command.", ephemeral=True)
+
+
+def is_dev_or_dev_role(interaction: discord.Interaction) -> bool:
+    if interaction.user.id == DEV_USER_ID:
+        return True
+    if isinstance(interaction.user, discord.Member):
+        return any(r.name == "Dev" for r in interaction.user.roles)
+    return False
+
+
+@bot.tree.command(name="enable", description="Turn on AI chat (mention the bot to talk) (Dev only)")
+async def enable_ai_chat(interaction: discord.Interaction):
+    if not is_dev_or_dev_role(interaction):
+        await interaction.response.send_message("⛔ This command is restricted to the Dev only.", ephemeral=True)
+        return
+    _ai_chat_enabled[interaction.guild.id] = True
+    await interaction.response.send_message("✅ AI chat is now **enabled** — mention me to chat!")
+
+
+@bot.tree.command(name="disable", description="Turn off AI chat (Dev only)")
+async def disable_ai_chat(interaction: discord.Interaction):
+    if not is_dev_or_dev_role(interaction):
+        await interaction.response.send_message("⛔ This command is restricted to the Dev only.", ephemeral=True)
+        return
+    _ai_chat_enabled[interaction.guild.id] = False
+    await interaction.response.send_message("🔇 AI chat is now **disabled**.")
 
 
 @bot.tree.command(name="removewarning", description="Remove a specific warning from a member (mod only)")
