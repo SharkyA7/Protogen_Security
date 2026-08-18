@@ -194,7 +194,7 @@ _known_webhooks = defaultdict(set)          # guild_id -> set[webhook_id]
 
 # ── AI CHAT (Groq / Llama 4 Scout) ───────────────────────────
 AI_CHAT_CHANNEL_NAME = "ai-chat"
-GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+GROQ_MODEL = "openai/gpt-oss-20b"  # Llama models were retired from Groq in June 2026; this is Groq's recommended open-weight replacement
 AI_SYSTEM_PROMPT = (
     "You are a friendly, helpful assistant chatting in a Discord server. "
     "Keep replies warm, clear, and reasonably concise (a few sentences unless more detail is truly needed). "
