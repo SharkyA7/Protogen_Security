@@ -277,6 +277,25 @@ async def send_ai_reply(message: discord.Message, reply_text: str):
             await message.channel.send(chunk)
 
 
+def _fetch_pollinations_image_sync(prompt: str) -> bytes:
+    """Blocking call to Pollinations' free, no-key image API — run off the event loop."""
+    from urllib.parse import quote
+    url = f"https://image.pollinations.ai/prompt/{quote(prompt)}"
+    r = requests.get(url, params={"width": 1024, "height": 1024, "nologo": "true"}, timeout=60)
+    r.raise_for_status()
+    return r.content
+
+
+async def generate_image(prompt: str):
+    """Returns image bytes, or None on failure."""
+    try:
+        return await asyncio.to_thread(_fetch_pollinations_image_sync, prompt)
+    except Exception as e:
+        logger.error(f"Pollinations image error: {e}")
+        return None
+
+
+
 def get_mod_log_channel(guild: discord.Guild):
     return discord.utils.get(guild.text_channels, name=MOD_LOG_CHANNEL_NAME)
 
@@ -1775,6 +1794,7 @@ async def help_command(interaction: discord.Interaction):
             "`/botinfo` — View bot info (ping, uptime)\n"
             "`/help` — Show this command list\n"
             "💬 **Mention the bot in #ai-chat** — Chat with the AI assistant (if enabled)\n"
+            "`/imagine <prompt>` — Generate an image from text (in #ai-chat)\n"
             "🤝 **Partnership** button — Submit a partnership request\n"
             "🛡 **Sign Up Moderator** button — Apply to become a Moderator"
         ),
@@ -1971,6 +1991,36 @@ async def disable_ai_chat(interaction: discord.Interaction):
         return
     _ai_chat_enabled[interaction.guild.id] = False
     await interaction.response.send_message("🔇 AI chat is now **disabled**.")
+
+
+@bot.tree.command(name="imagine", description="Generate an image from a text prompt (in #ai-chat)")
+@app_commands.describe(prompt="Describe the image you want")
+async def imagine(interaction: discord.Interaction, prompt: str):
+    if interaction.channel.name != AI_CHAT_CHANNEL_NAME:
+        target_channel = discord.utils.get(interaction.guild.text_channels, name=AI_CHAT_CHANNEL_NAME)
+        await interaction.response.send_message(
+            f"💬 This command only works in "
+            f"{f'<#{target_channel.id}>' if target_channel else f'#{AI_CHAT_CHANNEL_NAME}'}.",
+            ephemeral=True
+        )
+        return
+
+    if not _ai_chat_enabled[interaction.guild.id]:
+        await interaction.response.send_message("🔇 AI features are currently disabled.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    image_bytes = await generate_image(prompt)
+
+    if image_bytes is None:
+        await interaction.followup.send("⚠ Couldn't generate that image — try again in a moment.")
+        return
+
+    file = discord.File(io.BytesIO(image_bytes), filename="imagine.png")
+    embed = discord.Embed(title="🎨 Generated Image", description=f"**Prompt:** {prompt}", color=0x9B59B6)
+    embed.set_image(url="attachment://imagine.png")
+    embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+    await interaction.followup.send(embed=embed, file=file)
 
 
 @bot.tree.command(name="removewarning", description="Remove a specific warning from a member (mod only)")
