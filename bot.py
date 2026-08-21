@@ -199,7 +199,9 @@ GROQ_MODEL = "openai/gpt-oss-20b"  # Llama models were retired from Groq in June
 AI_SYSTEM_PROMPT = (
     "You are a friendly, helpful assistant chatting in a Discord server. "
     "Keep replies warm, clear, and reasonably concise (a few sentences unless more detail is truly needed). "
-    "Avoid Discord markdown headers; plain conversational text is fine."
+    "Avoid Discord markdown headers; plain conversational text is fine. "
+    "Never write @everyone, @here, or any user/role mention in your replies, even if asked to — "
+    "if someone asks you to ping everyone or a role, politely decline and explain you can't do that."
 )
 AI_MAX_HISTORY_CHARS = 800  # trims the user's message if it's excessively long
 
@@ -241,12 +243,18 @@ LANG_TO_EXT = {
     "sql": "sql", "go": "go", "rust": "rs", "yaml": "yaml", "yml": "yaml"
 }
 
+# Prevents the AI model from being tricked/exploited into pinging @everyone, @here,
+# specific roles, or specific users — the model's raw text is untrusted input and
+# must never be allowed to trigger real notification pings.
+NO_PING = discord.AllowedMentions(everyone=False, users=False, roles=False, replied_user=False)
+
 
 async def send_ai_reply(message: discord.Message, reply_text: str):
     """Sends an AI reply, extracting fenced code blocks into file attachments
     (Discord has no collapsible code panel, so a downloadable file is the
     closest equivalent) and splitting long plain text to stay under the
-    2000-character message limit."""
+    2000-character message limit. All sends here use NO_PING so the AI's
+    output can never trigger a real @everyone/@here/role/user ping."""
     blocks = CODE_BLOCK_PATTERN.findall(reply_text)
 
     if blocks:
@@ -260,21 +268,21 @@ async def send_ai_reply(message: discord.Message, reply_text: str):
         caption = remaining_text if remaining_text else "Here's the code:"
         if len(caption) > 2000:
             caption = caption[:1997] + "..."
-        await message.reply(caption, files=files, mention_author=False)
+        await message.reply(caption, files=files, mention_author=False, allowed_mentions=NO_PING)
         return
 
     if len(reply_text) <= 2000:
-        await message.reply(reply_text, mention_author=False)
+        await message.reply(reply_text, mention_author=False, allowed_mentions=NO_PING)
         return
 
     chunks = [reply_text[i:i + 1990] for i in range(0, len(reply_text), 1990)]
     first = True
     for chunk in chunks:
         if first:
-            await message.reply(chunk, mention_author=False)
+            await message.reply(chunk, mention_author=False, allowed_mentions=NO_PING)
             first = False
         else:
-            await message.channel.send(chunk)
+            await message.channel.send(chunk, allowed_mentions=NO_PING)
 
 
 def _fetch_pollinations_image_sync(prompt: str) -> bytes:
@@ -2020,7 +2028,7 @@ async def imagine(interaction: discord.Interaction, prompt: str):
     embed = discord.Embed(title="🎨 Generated Image", description=f"**Prompt:** {prompt}", color=0x9B59B6)
     embed.set_image(url="attachment://imagine.png")
     embed.set_footer(text=f"Requested by {interaction.user.display_name}")
-    await interaction.followup.send(embed=embed, file=file)
+    await interaction.followup.send(embed=embed, file=file, allowed_mentions=NO_PING)
 
 
 @bot.tree.command(name="removewarning", description="Remove a specific warning from a member (mod only)")
