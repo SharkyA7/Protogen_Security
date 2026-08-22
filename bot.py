@@ -20,6 +20,7 @@ TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+XAI_API_KEY = os.environ.get("XAI_API_KEY", "")
 
 # ── LOGGING ───────────────────────────────────────────────
 logging.basicConfig(
@@ -193,9 +194,10 @@ _raid_mode_active = defaultdict(bool)       # guild_id -> bool
 _known_webhooks = defaultdict(set)          # guild_id -> set[webhook_id]
 
 
-# ── AI CHAT (Groq / Llama 4 Scout) ───────────────────────────
+# ── AI CHAT (Groq / xAI Grok) ─────────────────────────────────
 AI_CHAT_CHANNEL_NAME = "ai-chat"
 GROQ_MODEL = "openai/gpt-oss-20b"  # Llama models were retired from Groq in June 2026; this is Groq's recommended open-weight replacement
+XAI_MODEL = "grok-4.6"  # paid API — usage on this model incurs real cost on the xAI account
 AI_SYSTEM_PROMPT = (
     "You are a friendly, helpful assistant chatting in a Discord server. "
     "Keep replies warm, clear, and reasonably concise (a few sentences unless more detail is truly needed). "
@@ -205,7 +207,8 @@ AI_SYSTEM_PROMPT = (
 )
 AI_MAX_HISTORY_CHARS = 800  # trims the user's message if it's excessively long
 
-_ai_chat_enabled = defaultdict(lambda: True)  # guild_id -> bool, default ON
+_ai_chat_enabled = defaultdict(lambda: True)     # guild_id -> bool, default ON
+_ai_provider = defaultdict(lambda: "groq")        # guild_id -> "groq" or "grok"
 
 _groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
@@ -224,7 +227,41 @@ def _groq_chat_sync(user_message: str) -> str:
     return completion.choices[0].message.content
 
 
-async def generate_ai_reply(user_message: str) -> str:
+def _xai_chat_sync(user_message: str) -> str:
+    """Blocking call to xAI's Grok API (OpenAI-compatible REST endpoint) — run off the event loop."""
+    r = requests.post(
+        "https://api.x.ai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {XAI_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": XAI_MODEL,
+            "messages": [
+                {"role": "system", "content": AI_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message[:AI_MAX_HISTORY_CHARS]}
+            ],
+            "max_tokens": 1500,
+            "temperature": 0.7
+        },
+        timeout=30
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+async def generate_ai_reply(user_message: str, guild_id: int) -> str:
+    provider = _ai_provider[guild_id]
+
+    if provider == "grok":
+        if not XAI_API_KEY:
+            return "⚠ Grok isn't configured yet — an `XAI_API_KEY` needs to be set."
+        try:
+            return await asyncio.to_thread(_xai_chat_sync, user_message)
+        except Exception as e:
+            logger.error(f"xAI Grok chat error: {e}")
+            return "⚠ Sorry, I couldn't get a response right now — try again in a moment."
+
     if _groq_client is None:
         return "⚠ AI chat isn't configured yet — a `GROQ_API_KEY` needs to be set."
     try:
@@ -445,7 +482,7 @@ async def on_message(message):
 
         if clean_content:
             async with message.channel.typing():
-                reply = await generate_ai_reply(clean_content)
+                reply = await generate_ai_reply(clean_content, message.guild.id)
             await send_ai_reply(message, reply)
             return
 
@@ -1390,6 +1427,58 @@ async def setup_content_creator_error(interaction: discord.Interaction, error):
         await interaction.response.send_message("\u26a0 You don't have permission to run this command.", ephemeral=True)
 
 
+# ── USER REPORTS ──────────────────────────────────────────
+CONTROL_ROOM_CHANNEL_NAME = "control-room"
+
+
+def get_control_room_channel(guild: discord.Guild):
+    return discord.utils.get(guild.text_channels, name=CONTROL_ROOM_CHANNEL_NAME)
+
+
+@bot.tree.command(name="reportuser", description="Report a member to the mod/dev team (sent privately to #control-room)")
+@app_commands.describe(member="Member you're reporting", reason="What happened", details="Any additional details (optional)")
+async def reportuser(interaction: discord.Interaction, member: discord.Member, reason: str, details: str = None):
+    control_room = get_control_room_channel(interaction.guild)
+    if control_room is None:
+        await interaction.response.send_message(
+            f"⚠ The report couldn't be sent — no `#{CONTROL_ROOM_CHANNEL_NAME}` channel exists yet.",
+            ephemeral=True
+        )
+        return
+
+    if member.id == interaction.user.id:
+        await interaction.response.send_message("⚠ You can't report yourself.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="🚩 New User Report", color=0xE74C3C, timestamp=discord.utils.utcnow())
+    embed.add_field(name="Reported User", value=f"{member.mention} (`{member.id}`)", inline=False)
+    embed.add_field(name="Reported By", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    if details:
+        embed.add_field(name="Additional Details", value=details, inline=False)
+    embed.add_field(name="Channel", value=interaction.channel.mention, inline=False)
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    ping_roles = [r for r in interaction.guild.roles if r.name in ("Moderator", "Dev")]
+    ping_text = " ".join(r.mention for r in ping_roles) if ping_roles else ""
+
+    try:
+        await control_room.send(
+            content=ping_text if ping_text else None,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(roles=True, everyone=False, users=False)
+        )
+        await interaction.response.send_message(
+            "✅ Your report has been sent to the mod/dev team privately. Thank you for flagging this.",
+            ephemeral=True
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            f"⚠ I don't have permission to post in {control_room.mention}.",
+            ephemeral=True
+        )
+
+
 # ── MODERATION COMMANDS ───────────────────────────────────
 
 @bot.tree.command(name="kick", description="Kick a member from the server (mod only)")
@@ -1751,6 +1840,66 @@ async def revokerole_error(interaction: discord.Interaction, error):
         await interaction.response.send_message("⚠ You don't have permission to run this command.", ephemeral=True)
 
 
+ADULT_ROLE_NAME = "Verified 18+"
+
+
+@bot.tree.command(name="verifyadult", description="Grant the Verified 18+ role after confirming a member's age (mod only)")
+@app_commands.describe(member="Member to verify as an adult")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def verifyadult(interaction: discord.Interaction, member: discord.Member):
+    role = discord.utils.get(interaction.guild.roles, name=ADULT_ROLE_NAME)
+    if role is None:
+        await interaction.response.send_message(
+            f"⚠ No role named **{ADULT_ROLE_NAME}** exists yet — create it in Server Settings → Roles first.",
+            ephemeral=True
+        )
+        return
+
+    if role in member.roles:
+        await interaction.response.send_message(f"⚠ {member.mention} already has **{role.name}**.", ephemeral=True)
+        return
+
+    try:
+        await member.add_roles(role, reason=f"Age verified by {interaction.user}")
+        await interaction.response.send_message(f"✅ {member.mention} has been granted **{role.name}**.")
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "⚠ I don't have permission to add this role (check role hierarchy).",
+            ephemeral=True
+        )
+
+
+@verifyadult.error
+async def verifyadult_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("⚠ You don't have permission to run this command.", ephemeral=True)
+
+
+@bot.tree.command(name="removeadult", description="Remove the Verified 18+ role from a member (mod only)")
+@app_commands.describe(member="Member to remove the role from", reason="Reason for removing")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def removeadult(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    role = discord.utils.get(interaction.guild.roles, name=ADULT_ROLE_NAME)
+    if role is None or role not in member.roles:
+        await interaction.response.send_message(f"⚠ {member.mention} doesn't have **{ADULT_ROLE_NAME}**.", ephemeral=True)
+        return
+
+    try:
+        await member.remove_roles(role, reason=reason)
+        await interaction.response.send_message(f"🚫 **{role.name}** has been removed from {member.mention}.\nReason: {reason}")
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "⚠ I don't have permission to remove this role (check role hierarchy).",
+            ephemeral=True
+        )
+
+
+@removeadult.error
+async def removeadult_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("⚠ You don't have permission to run this command.", ephemeral=True)
+
+
 @bot.tree.command(name="myinfo", description="Check your own info (or another member's) including warnings")
 @app_commands.describe(member="Member to check (leave empty to check yourself)")
 async def myinfo(interaction: discord.Interaction, member: discord.Member = None):
@@ -1798,6 +1947,7 @@ async def help_command(interaction: discord.Interaction):
             "`/myinfo [member]` — View your or another member's info & warnings\n"
             "`/addinfo` — Fill in your dev info (name, age, language, about)\n"
             "`/devinfo [member]` — View your or another member's dev info\n"
+            "`/reportuser` — Privately report a member to the mod/dev team\n"
             "`/serverstats` — View server statistics\n"
             "`/botinfo` — View bot info (ping, uptime)\n"
             "`/help` — Show this command list\n"
@@ -1821,6 +1971,7 @@ async def help_command(interaction: discord.Interaction):
             "`/warnings` — View a member's warning history\n"
             "`/removewarning` — Remove a specific warning\n"
             "`/revokerole` — Revoke a role as punishment\n"
+            "`/verifyadult` / `/removeadult` — Grant or remove the Verified 18+ role\n"
             "`/slowmode` — Set channel slowmode delay\n"
             "`/lock` / `/unlock` — Lock or unlock a channel\n"
             "`/nickname` — Change a member's nickname"
@@ -1999,6 +2150,29 @@ async def disable_ai_chat(interaction: discord.Interaction):
         return
     _ai_chat_enabled[interaction.guild.id] = False
     await interaction.response.send_message("🔇 AI chat is now **disabled**.")
+
+
+@bot.tree.command(name="changeaimodel", description="Switch the AI chat provider between Groq and Grok (Dev only)")
+@app_commands.describe(provider="Which AI provider to use")
+@app_commands.choices(provider=[
+    app_commands.Choice(name="Groq (free)", value="groq"),
+    app_commands.Choice(name="Grok / xAI (paid)", value="grok"),
+])
+async def changeaimodel(interaction: discord.Interaction, provider: app_commands.Choice[str]):
+    if not is_dev_or_dev_role(interaction):
+        await interaction.response.send_message("⛔ This command is restricted to the Dev only.", ephemeral=True)
+        return
+
+    if provider.value == "grok" and not XAI_API_KEY:
+        await interaction.response.send_message(
+            "⚠ Can't switch to Grok — no `XAI_API_KEY` is set in the environment yet.",
+            ephemeral=True
+        )
+        return
+
+    _ai_provider[interaction.guild.id] = provider.value
+    warning = "\n💰 Heads up: Grok's API is **paid**, usage will incur real cost." if provider.value == "grok" else ""
+    await interaction.response.send_message(f"🔀 AI chat provider switched to **{provider.name}**.{warning}")
 
 
 @bot.tree.command(name="imagine", description="Generate an image from a text prompt (in #ai-chat)")
